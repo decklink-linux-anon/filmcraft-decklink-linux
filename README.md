@@ -1,6 +1,6 @@
 # UNMAINTAINED. NO SUPPORT.
 
-**Issues and pull requests are disabled.** This is a one-off snapshot of a prototype, not a project that will be maintained.
+**This is a one-off snapshot of a prototype, not a project that will be maintained.** Issues and the wiki are open so users can share notes and fixes with each other, but the author may not read or answer them. Feel free to fork it and carry it further.
 
 **Use at your own risk.** There is no warranty of any kind, express or implied, and no liability for damage to hardware, software or data, or for any other loss, arising from its use. The same MIT OR Apache-2.0 licence terms as FilmCraft apply (`LICENSE-MIT`, `LICENSE-APACHE`).
 
@@ -62,7 +62,6 @@ A C++ compiler (`g++`) is required in addition to FilmCraft's usual build depend
 | `decklink-output.md` | the guide (same as `docs/decklink-output.md` in the series) |
 | `LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE` | copied from FilmCraft |
 | `SHA256SUMS` | checksums of the files in this repository |
-| `COMMENT_2174.txt` | draft comment for [storytold/filmcraft#2174](https://github.com/storytold/filmcraft/issues/2174) |
 
 The seven commits:
 
