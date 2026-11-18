@@ -1,0 +1,52 @@
+From 77febfc363b45ffe5626b6c8a07eff5fe8537caa Mon Sep 17 00:00:00 2001
+From: decklink-linux-anon
+ <358323356+decklink-linux-anon@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:41:27 +0200
+Subject: [PATCH 2/7] gpu: ExportRenderer::render_rgba8 / composite_rgba8
+
+Composite a frame (or an already prepared plan) on the off-screen export
+device and read it back as sRGB RGBA8 over black, the picture the
+monitors show. Used by External Video Output's GPU path, which needs a
+1080p frame per 40 ms without touching the UI thread.
+---
+ crates/gpu/src/export_renderer.rs | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/crates/gpu/src/export_renderer.rs b/crates/gpu/src/export_renderer.rs
+index 46080380..b5ae9343 100644
+--- a/crates/gpu/src/export_renderer.rs
++++ b/crates/gpu/src/export_renderer.rs
+@@ -173,6 +173,30 @@ impl ExportRenderer {
+     }
+ }
+ 
++impl ExportRenderer {
++    /// One frame as the monitors show it: sRGB RGBA8 over black at the render size, composited on
++    /// this device and read back (External Video Output). `None` when the device failed.
++    pub fn render_rgba8(&mut self, project: &Project, seq: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) -> Option<(u32, u32, Vec<u8>)> {
++        let plan = plan_frame(project, seq, t, opts, self.compositor.caps(), sources);
++        let prep = prepare(&plan);
++        self.composite_rgba8(&plan, &prep)
++    }
++
++    /// [`render_rgba8`](Self::render_rgba8) of a plan already made (and prepared) for
++    /// [`caps`](Self::caps), e.g. by the desktop app's frame workers.
++    pub fn composite_rgba8(&mut self, plan: &FramePlan, prep: &crate::PreparedPlan) -> Option<(u32, u32, Vec<u8>)> {
++        if let FramePlan::Image(img) = plan {
++            return Some((img.w as u32, img.h as u32, img.over_black_rgba8()));
++        }
++        if device_failed() {
++            return None;
++        }
++        self.compositor.composite_prepared(plan, Some(prep));
++        let out = self.compositor.read_output();
++        if device_failed() { None } else { out }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-- 
+2.43.0
+

@@ -1,0 +1,566 @@
+From 16671952fec4e5c2910b22bbb6c5b2b4ce0d4fa1 Mon Sep 17 00:00:00 2001
+From: decklink-linux-anon
+ <358323356+decklink-linux-anon@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:49:13 +0200
+Subject: [PATCH 6/7] decklink: External Video Output gamma (sRGB to Rec.709
+ BT.1886 / As is)
+
+Settings > Playback > External Video Output gamma (playback.transmitGamma):
+srgbToBt1886 (default: sRGB EOTF to linear, re-encoded with gamma 1/2.4 for a
+BT.1886 display; matched the Avid reference picture on the same TV) or asIs
+(the sRGB values unchanged). Folded into the RGB to Y'CbCr tables, so it costs
+nothing; switchable live (the current frame is resent).
+decklink-test --gamma srgbToBt1886|asIs (default srgbToBt1886).
+---
+ apps/filmcraft-cli/src/main.rs        | 13 +++--
+ apps/filmcraft/src/video_out.rs       |  8 ++-
+ crates/engine/src/autosave.rs         |  4 ++
+ crates/engine/src/settings/schema.rs  | 16 ++++++
+ crates/engine/src/settings_tests.rs   | 10 ++++
+ crates/platform/src/decklink.rs       | 70 ++++++++++++++++++++++-----
+ crates/platform/src/decklink/tests.rs | 33 +++++++++++++
+ crates/ui-egui/src/hooks.rs           | 26 ++++++++++
+ crates/ui-egui/src/lib.rs             |  2 +-
+ crates/ui-egui/src/transmit.rs        | 48 +++++++++++++++++-
+ docs/decklink-output.md               | 20 ++++++++
+ 11 files changed, 232 insertions(+), 18 deletions(-)
+
+diff --git a/apps/filmcraft-cli/src/main.rs b/apps/filmcraft-cli/src/main.rs
+index c4f67327..4176c366 100644
+--- a/apps/filmcraft-cli/src/main.rs
++++ b/apps/filmcraft-cli/src/main.rs
+@@ -99,10 +99,11 @@ SUBCOMMANDS
+                                 of the --project / --demo sequence from S: CPU render, GPU
+                                 composite + read-back, UYVY conversion, and (unless --no-card)
+                                 25 fps output on DeckLink device 0
+-  decklink-test [--seconds S] [--hold N] [--scale f]
++  decklink-test [--seconds S] [--hold N] [--scale f] [--gamma srgbToBt1886|asIs]
+                                 show a picture on DeckLink device 0 (1080p25, Linux) for N
+                                 seconds (default 10): with --project / --demo the Program frame
+-                                at S, otherwise 75 % colour bars
++                                at S, otherwise 75 % colour bars; --gamma as Settings ▸ Playback ▸
++                                External Video Output gamma (default srgbToBt1886)
+   probe <media> [--image-sequence]
+                                 media info as JSON, with MXF / Ogg / BWF details; with
+                                 --image-sequence <media> is the first numbered still of a sequence
+@@ -565,6 +566,11 @@ async fn cli_decklink_test(a: &Args) {
+         usage("decklink-test is headless; in the app turn on Settings ▸ Playback ▸ Enable External Video Output");
+     }
+     let hold: f64 = finite_opt::<f64>(a, "--hold").unwrap_or(10.0).clamp(0.0, 24.0 * 3600.0);
++    let transfer = match a.opt("--gamma") {
++        None | Some("srgbToBt1886") => decklink::Transfer::SrgbToBt1886,
++        Some("asIs") => decklink::Transfer::AsIs,
++        Some(g) => usage(format!("decklink-test: --gamma is srgbToBt1886 or asIs, not `{g}`")),
++    };
+     let picture: std::sync::Arc<dyn decklink::RgbaPicture> = if a.opt("--project").is_some() || a.flag("--demo") {
+         let Backend::Local(mut s) = Backend::open(a) else { usage("decklink-test is headless") };
+         let secs: f64 = finite_opt(a, "--seconds").unwrap_or(0.0);
+@@ -578,8 +584,9 @@ async fn cli_decklink_test(a: &Args) {
+         std::sync::Arc::new(decklink::color_bars(decklink::WIDTH, decklink::HEIGHT))
+     };
+     let out = decklink::Output::open().unwrap_or_else(|e| fail(format!("decklink-test: {e}")));
++    out.set_transfer(transfer);
+     let (w, h) = picture.size();
+-    diag(format_args!("decklink-test: showing a {w}x{h} picture on {} (1080p25) for {hold:.0} s", out.name()));
++    diag(format_args!("decklink-test: showing a {w}x{h} picture on {} (1080p25, gamma {transfer:?}) for {hold:.0} s", out.name()));
+     out.send(picture);
+     std::thread::sleep(std::time::Duration::from_secs_f64(hold));
+     let (shown, failed) = out.counts();
+diff --git a/apps/filmcraft/src/video_out.rs b/apps/filmcraft/src/video_out.rs
+index 2f30fa70..3c966264 100644
+--- a/apps/filmcraft/src/video_out.rs
++++ b/apps/filmcraft/src/video_out.rs
+@@ -4,7 +4,7 @@
+ use std::sync::Arc;
+ 
+ use filmcraft_platform::decklink;
+-use filmcraft_ui_egui::VideoOutput;
++use filmcraft_ui_egui::{OutputTransfer, VideoOutput};
+ use filmcraft_ui_egui::frames::Rgba;
+ 
+ /// A monitor frame handed to the output thread without copying.
+@@ -33,6 +33,12 @@ impl VideoOutput for DeckLink {
+     fn send(&self, frame: Arc<Rgba>) {
+         self.0.send(Arc::new(Picture(frame)));
+     }
++    fn set_transfer(&self, transfer: OutputTransfer) {
++        self.0.set_transfer(match transfer {
++            OutputTransfer::AsIs => decklink::Transfer::AsIs,
++            OutputTransfer::SrgbToBt1886 => decklink::Transfer::SrgbToBt1886,
++        });
++    }
+ }
+ 
+ /// Open DeckLink device 0 at 1080p25.
+diff --git a/crates/engine/src/autosave.rs b/crates/engine/src/autosave.rs
+index 2013b28a..3165fe97 100644
+--- a/crates/engine/src/autosave.rs
++++ b/crates/engine/src/autosave.rs
+@@ -91,6 +91,9 @@ pub struct PlaybackPrefs {
+     pub step_many_frames: u32,
+     pub pause_encoder_queue: bool,
+     pub enable_transmit: bool,
++    /// "External Video Output gamma": `srgbToBt1886` (default: re-encoded for a BT.1886
++    /// gamma-2.4 monitor) or `asIs` (the sRGB code values sent unchanged as BT.709).
++    pub transmit_gamma: String,
+     pub disable_video_in_background: bool,
+     /// Draft decoding while playing at 1/2 resolution or lower: H.264 non-reference pictures
+     /// skip deblocking (faster; those frames are approximate). Never used for exports, renders or
+@@ -111,6 +114,7 @@ impl Default for PlaybackPrefs {
+             step_many_frames: 5,
+             pause_encoder_queue: true,
+             enable_transmit: false,
++            transmit_gamma: "srgbToBt1886".into(),
+             disable_video_in_background: true,
+             draft_decode: false,
+             hardware_decoding: "auto".into(),
+diff --git a/crates/engine/src/settings/schema.rs b/crates/engine/src/settings/schema.rs
+index d89e29f0..bfd5dce9 100644
+--- a/crates/engine/src/settings/schema.rs
++++ b/crates/engine/src/settings/schema.rs
+@@ -118,6 +118,21 @@ const TRANSMIT: Row = if cfg!(target_os = "linux") {
+     pending("playback.enableTransmit", "Enable External Video Output")
+ };
+ 
++/// How External Video Output encodes the sRGB picture (`playback.transmitGamma`).
++pub const TRANSMIT_GAMMAS: &[(&str, &str)] =
++    &[("srgbToBt1886", "sRGB to Rec.709 (BT.1886, gamma 2.4 monitor)"), ("asIs", "As is (sRGB values unchanged)")];
++
++/// "External Video Output gamma", under the switch (Linux; elsewhere remembered, greyed out).
++const TRANSMIT_GAMMA: Row = Row::Field(Field {
++    key: "playback.transmitGamma",
++    label: "External Video Output gamma",
++    kind: Kind::Choice(TRANSMIT_GAMMAS),
++    indent: true,
++    enabled_by: Some("playback.enableTransmit"),
++    wired: cfg!(target_os = "linux"),
++    unavailable: !cfg!(target_os = "linux"),
++});
++
+ const fn int(min: f64, max: f64, unit: &'static str) -> Kind {
+     Kind::Int { min, max, unit }
+ }
+@@ -539,6 +554,7 @@ pub(super) static CATEGORIES: &[Category] = &[
+             f("playback.stepManyFrames", "Step forward/back many", int(1.0, 1000.0, "frames"), true),
+             b("playback.pauseEncoderQueue", "Pause Media Encoder queue during playback", false),
+             TRANSMIT,
++            TRANSMIT_GAMMA,
+             b("playback.disableVideoInBackground", "Disable video output when in the background", false),
+             b("playback.draftDecode", "Draft decoding at reduced playback resolution (H.264: faster, some frames less filtered)", true),
+             f("playback.hardwareDecoding", "Hardware decoding", Kind::Choice(HW_DECODE), true),
+diff --git a/crates/engine/src/settings_tests.rs b/crates/engine/src/settings_tests.rs
+index 8ca0d89f..a90f27ae 100644
+--- a/crates/engine/src/settings_tests.rs
++++ b/crates/engine/src/settings_tests.rs
+@@ -889,6 +889,16 @@ fn hardware_decoding_setting_drives_the_decoder_switch() {
+     } else {
+         assert!(!transmit.wired && transmit.unavailable, "External Video Output must not claim to work");
+     }
++    // "External Video Output gamma": `srgbToBt1886` by default, a choice under the switch, validated like
++    // the other choices. Checked here, not in a test of its own: every `prefs.set` re-applies the
++    // process-wide hardware decoding switch, which a parallel test would race with.
++    assert_eq!(s.prefs.playback.transmit_gamma, "srgbToBt1886", "BT.1886 by default");
++    set(&mut s, "playback.transmitGamma", json!("asIs"));
++    assert_eq!(s.prefs.playback.transmit_gamma, "asIs");
++    assert!(s.execute("prefs.set", json!({"key": "playback.transmitGamma", "value": "gamma22"})).is_err());
++    let f = settings::field("playback.transmitGamma").expect("playback.transmitGamma");
++    assert!(matches!(f.kind, Kind::Choice(_)) && f.indent && f.enabled_by == Some("playback.enableTransmit"));
++    assert_eq!(f.wired, cfg!(target_os = "linux"));
+ }
+ 
+ /// Settings ▸ Timeline ▸ "Place files dropped onto the Timeline directly on the Timeline": on by default.
+diff --git a/crates/platform/src/decklink.rs b/crates/platform/src/decklink.rs
+index 0dc1e714..6eb7913b 100644
+--- a/crates/platform/src/decklink.rs
++++ b/crates/platform/src/decklink.rs
+@@ -8,6 +8,11 @@
+ //! fitted inside 1920 x 1080, letterboxed or pillarboxed in black) and shows it at the card's next
+ //! frame boundary (`DisplayVideoFrameSync`). No audio.
+ //!
++//! [`Transfer`] says how the picture's code values become the card's: re-encoded from sRGB for a
++//! BT.1886 (gamma 2.4) display ([`Transfer::SrgbToBt1886`], the default), or unchanged
++//! ([`Transfer::AsIs`]). Both are folded into the conversion tables, so neither costs time.
++//! [`rgba_to_uyvy`] itself is the plain (as is) conversion.
++//!
+ //! Linux only for now: the C++ shim (`decklink/shim.cpp`, built by `build.rs`) loads
+ //! `libDeckLinkAPI.so` from Blackmagic Desktop Video at run time. Elsewhere, and on Linux without
+ //! the library or a card, [`Output::open`] returns an [`OpenError`].
+@@ -84,9 +89,35 @@ impl std::fmt::Display for OpenError {
+ 
+ impl std::error::Error for OpenError {}
+ 
++/// How the picture's R'G'B' code values are encoded for the card.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum Transfer {
++    /// Sent unchanged: the sRGB-encoded values go out as BT.709 code values.
++    AsIs,
++    /// The default. Decoded with the sRGB EOTF and re-encoded for a BT.1886 display (pure gamma 2.4), so a
++    /// Rec.709 monitor or TV shows what an sRGB computer monitor shows: `out = sRGB_EOTF(v)^(1/2.4)`.
++    #[default]
++    SrgbToBt1886,
++}
++
++impl Transfer {
++    /// The re-encoded value of an 8-bit code value `v`, 0–1.
++    fn encode(self, v: usize) -> f64 {
++        let x = v as f64 / 255.0;
++        match self {
++            Self::AsIs => x,
++            Self::SrgbToBt1886 => {
++                let lin = if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) };
++                lin.powf(1.0 / 2.4)
++            }
++        }
++    }
++}
++
+ #[derive(Default)]
+ struct Slot {
+     latest: Option<Arc<dyn RgbaPicture>>,
++    transfer: Transfer,
+     quit: bool,
+     /// Pictures the card accepted.
+     shown: u64,
+@@ -156,6 +187,11 @@ impl Output {
+         Stats { shown: slot.shown, failed: slot.failed, convert: slot.convert, display: slot.display }
+     }
+ 
++    /// Encode the pictures sent from now on with `transfer` (the next picture shows it).
++    pub fn set_transfer(&self, transfer: Transfer) {
++        self.shared.0.lock().unwrap_or_else(PoisonError::into_inner).transfer = transfer;
++    }
++
+     /// Show `picture` as soon as possible, replacing any picture not shown yet.
+     pub fn send(&self, picture: Arc<dyn RgbaPicture>) {
+         let (m, cv) = &*self.shared;
+@@ -190,10 +226,10 @@ fn run(shared: &Shared, ready: &std::sync::mpsc::SyncSender<Result<String, OpenE
+     }
+     let mut uyvy = vec![0u8; ROW_BYTES * HEIGHT];
+     let mut warned = false;
+-    while let Some(picture) = next_picture(shared) {
++    while let Some((picture, transfer)) = next_picture(shared) {
+         let (w, h) = picture.size();
+         let t0 = std::time::Instant::now();
+-        rgba_to_uyvy(picture.rgba(), w, h, &mut uyvy, WIDTH, HEIGHT);
++        rgba_to_uyvy_with(picture.rgba(), w, h, &mut uyvy, WIDTH, HEIGHT, transfer);
+         let t1 = std::time::Instant::now();
+         let shown = device.display(&uyvy);
+         count(shared, shown.is_ok(), t1 - t0, t1.elapsed());
+@@ -217,8 +253,9 @@ fn count(shared: &Shared, ok: bool, convert: std::time::Duration, display: std::
+     }
+ }
+ 
+-/// Wait for the next picture; `None` when the output is being closed.
+-fn next_picture(shared: &Shared) -> Option<Arc<dyn RgbaPicture>> {
++/// Wait for the next picture and the transfer to show it with; `None` when the output is being
++/// closed.
++fn next_picture(shared: &Shared) -> Option<(Arc<dyn RgbaPicture>, Transfer)> {
+     let (m, cv) = &**shared;
+     let mut slot = m.lock().unwrap_or_else(PoisonError::into_inner);
+     loop {
+@@ -226,7 +263,7 @@ fn next_picture(shared: &Shared) -> Option<Arc<dyn RgbaPicture>> {
+             return None;
+         }
+         if let Some(p) = slot.latest.take() {
+-            return Some(p);
++            return Some((p, slot.transfer));
+         }
+         slot = cv.wait(slot).unwrap_or_else(PoisonError::into_inner);
+     }
+@@ -252,7 +289,8 @@ impl Device {
+     }
+ }
+ 
+-/// Fixed-point BT.709 limited-range tables (16 fractional bits): each R', G', B' code value's
++/// Fixed-point BT.709 limited-range tables (16 fractional bits), one set per [`Transfer`] (the
++/// code value re-encoded first): each R', G', B' code value's
+ /// contribution to Y' (offset 16 included in `y_off`), Cb and Cr (ITU-R BT.709-6, Table 4:
+ /// Y' = 16 + 219 E'y, Cb = 128 + 224 (E'b - E'y) / 1.8556, Cr = 128 + 224 (E'r - E'y) / 1.5748).
+ struct Tables {
+@@ -263,15 +301,20 @@ struct Tables {
+ 
+ const FRAC: i32 = 16;
+ 
+-fn tables() -> &'static Tables {
+-    static T: std::sync::OnceLock<Tables> = std::sync::OnceLock::new();
+-    T.get_or_init(|| {
++fn tables(transfer: Transfer) -> &'static Tables {
++    static AS_IS: std::sync::OnceLock<Tables> = std::sync::OnceLock::new();
++    static BT1886: std::sync::OnceLock<Tables> = std::sync::OnceLock::new();
++    let cell = match transfer {
++        Transfer::AsIs => &AS_IS,
++        Transfer::SrgbToBt1886 => &BT1886,
++    };
++    cell.get_or_init(|| {
+         let (kr, kg, kb) = (0.2126f64, 0.7152f64, 0.0722f64);
+         let ky = [kr, kg, kb];
+         // E'b - E'y and E'r - E'y as weights of R', G', B'
+         let kcb = [-kr / 1.8556, -kg / 1.8556, (1.0 - kb) / 1.8556];
+         let kcr = [(1.0 - kr) / 1.5748, -kg / 1.5748, -kb / 1.5748];
+-        let fixed = |k: f64, v: usize| (k * v as f64 / 255.0 * f64::from(1 << FRAC)).round() as i32;
++        let fixed = |k: f64, v: usize| (k * transfer.encode(v) * f64::from(1 << FRAC)).round() as i32;
+         let mut t = Tables { y: [[0; 256]; 3], cb: [[0; 256]; 3], cr: [[0; 256]; 3] };
+         for c in 0..3 {
+             for v in 0..256 {
+@@ -310,11 +353,16 @@ const BLACK: [u8; 4] = [128, 16, 128, 16];
+ ///
+ /// Integer table arithmetic (about 3 ms for a 1080p frame): this runs for every frame sent.
+ pub fn rgba_to_uyvy(src: &[u8], sw: usize, sh: usize, dst: &mut [u8], dw: usize, dh: usize) {
++    rgba_to_uyvy_with(src, sw, sh, dst, dw, dh, Transfer::AsIs);
++}
++
++/// [`rgba_to_uyvy`] with the code values re-encoded by `transfer` (same cost: it is in the tables).
++pub fn rgba_to_uyvy_with(src: &[u8], sw: usize, sh: usize, dst: &mut [u8], dw: usize, dh: usize, transfer: Transfer) {
+     let valid = sw.checked_mul(sh).and_then(|n| n.checked_mul(4)).is_some_and(|n| src.len() >= n);
+     let (x0, y0, w, h) = if valid { fit(sw, sh, dw, dh) } else { (0, 0, 0, 0) };
+     // source byte offset of each output column within its row, or None for the bars
+     let cols: Vec<Option<usize>> = (0..dw).map(|x| (x >= x0 && x < x0 + w).then(|| ((x - x0) * sw / w).min(sw - 1) * 4)).collect();
+-    let t = tables();
++    let t = tables(transfer);
+     let px = |row: &[u8], col: Option<usize>| -> [usize; 3] {
+         match col.and_then(|o| row.get(o..o + 3)) {
+             Some(p) => [usize::from(p[0]), usize::from(p[1]), usize::from(p[2])],
+diff --git a/crates/platform/src/decklink/tests.rs b/crates/platform/src/decklink/tests.rs
+index 4dd4cb5c..a7d31ac7 100644
+--- a/crates/platform/src/decklink/tests.rs
++++ b/crates/platform/src/decklink/tests.rs
+@@ -78,3 +78,36 @@ fn opening_without_a_card_is_an_error_not_a_crash() {
+         assert!(!e.to_string().is_empty());
+     }
+ }
++
++fn uyvy_with(rgb: [u8; 3], transfer: Transfer) -> [u8; 4] {
++    let src = [rgb[0], rgb[1], rgb[2], 255, rgb[0], rgb[1], rgb[2], 255];
++    let mut dst = [0u8; 4];
++    rgba_to_uyvy_with(&src, 2, 1, &mut dst, 2, 1, transfer);
++    dst
++}
++
++#[test]
++fn bt1886_is_the_default_transfer_and_as_is_the_plain_conversion() {
++    assert_eq!(Transfer::default(), Transfer::SrgbToBt1886);
++    for v in [0u8, 25, 128, 200, 255] {
++        assert_eq!(uyvy_with([v, v / 2, 255 - v], Transfer::AsIs), uyvy_of([v, v / 2, 255 - v]));
++    }
++}
++
++#[test]
++fn srgb_to_bt1886_keeps_black_white_and_primaries_and_lifts_the_shadows() {
++    let t = Transfer::SrgbToBt1886;
++    assert_eq!(uyvy_with([0, 0, 0], t), [128, 16, 128, 16]);
++    assert_eq!(uyvy_with([255, 255, 255], t), [128, 235, 128, 235]);
++    assert_eq!(uyvy_with([255, 0, 0], t), uyvy_of([255, 0, 0]));
++    // mid grey: sRGB 128 is 21.6 % linear, 0.528 in gamma 2.4: Y' 16 + 219 * 0.528 = 131.6
++    let grey = uyvy_with([128, 128, 128], t);
++    assert!((131..=132).contains(&grey[1]), "{grey:?}");
++    assert_eq!((grey[0], grey[2]), (128, 128), "greys stay neutral");
++    // dark grey: sRGB 25 is ~1 % linear, 0.146 in gamma 2.4 (Y' 48; unchanged it is 37)
++    assert_eq!(uyvy_with([25, 25, 25], t)[1], 48);
++    assert_eq!(uyvy_of([25, 25, 25])[1], 37);
++    // monotonic
++    let ys: Vec<u8> = (0..=255u8).map(|v| uyvy_with([v, v, v], t)[1]).collect();
++    assert!(ys.windows(2).all(|w| w[0] <= w[1]));
++}
+diff --git a/crates/ui-egui/src/hooks.rs b/crates/ui-egui/src/hooks.rs
+index a59c423b..d2fb604b 100644
+--- a/crates/ui-egui/src/hooks.rs
++++ b/crates/ui-egui/src/hooks.rs
+@@ -44,6 +44,32 @@ pub trait VideoOutput: Send + Sync {
+     /// Show `frame` (sRGB RGBA8 over black) as soon as possible, replacing one not shown yet.
+     /// Must not block the UI thread.
+     fn send(&self, frame: std::sync::Arc<crate::frames::Rgba>);
++    /// Encode the frames sent from now on with `transfer` (Settings ▸ Playback ▸ External Video
++    /// Output gamma). Must not block the UI thread.
++    fn set_transfer(&self, _transfer: OutputTransfer) {}
++}
++
++/// How External Video Output encodes the sRGB frames for the device
++/// (`playback.transmitGamma`).
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum OutputTransfer {
++    /// `asIs`: the sRGB code values unchanged.
++    AsIs,
++    /// `srgbToBt1886` (default): decoded from sRGB and re-encoded for a BT.1886 (gamma 2.4)
++    /// display, so a Rec.709 monitor shows what an sRGB computer monitor shows.
++    #[default]
++    SrgbToBt1886,
++}
++
++impl OutputTransfer {
++    /// The preference value's transfer; anything unknown is the default
++    /// ([`OutputTransfer::SrgbToBt1886`]).
++    pub fn from_pref(value: &str) -> Self {
++        match value {
++            "asIs" => Self::AsIs,
++            _ => Self::SrgbToBt1886,
++        }
++    }
+ }
+ 
+ /// Opens the external video output, or says why it can't.
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 164e815b..024758d3 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -102,7 +102,7 @@ mod raw_input;
+ use audio::shuttle_mix_rate;
+ pub use audio::{AUDIO_RETRY_S, AUDIO_STALL_S, playback_mix};
+ pub use gpu::{gpu_compositor_unsupported, software_rasterizer};
+-pub use hooks::{AudioDevices, AudioOut, ClipboardMedia, HostHooks, RelinkHint, SystemThemeFn, VideoOutput, VideoOutputOpener};
++pub use hooks::{AudioDevices, AudioOut, ClipboardMedia, HostHooks, OutputTransfer, RelinkHint, SystemThemeFn, VideoOutput, VideoOutputOpener};
+ pub(crate) use raw_input::rewrite_native_window_input;
+ 
+ pub use ime_reset::install_ime_reset_callbacks;
+diff --git a/crates/ui-egui/src/transmit.rs b/crates/ui-egui/src/transmit.rs
+index 5af9e950..0b02063d 100644
+--- a/crates/ui-egui/src/transmit.rs
++++ b/crates/ui-egui/src/transmit.rs
+@@ -19,6 +19,10 @@
+ //! when the setting is turned on; a missing card or driver is logged once and the output stays off
+ //! until the setting is turned off and on again. While playing, a line with the frame counts and
+ //! timings is logged every 5 s (`External Video Output: …`).
++//!
++//! Settings ▸ Playback ▸ External Video Output gamma (`playback.transmitGamma`) says how the sRGB
++//! frames are encoded for the card ([`OutputTransfer`]); a change applies to the next frame and the
++//! current frame is sent again, so it can be compared live.
+ 
+ use std::sync::{Arc, Condvar, Mutex, PoisonError};
+ use std::time::{Duration, Instant};
+@@ -28,7 +32,7 @@ use filmcraft_render::plan::DeviceCaps;
+ use filmcraft_time::FrameRate;
+ 
+ use crate::frames::{FrameKey, GpuPlan, PLAYING_REVISION_LAG, Rgba, Target};
+-use crate::hooks::{VideoOutput, VideoOutputOpener};
++use crate::hooks::{OutputTransfer, VideoOutput, VideoOutputOpener};
+ 
+ /// The output frame size.
+ pub const OUTPUT_SIZE: (u32, u32) = (1920, 1080);
+@@ -44,11 +48,13 @@ pub struct Transmit {
+     gpu_allowed: bool,
+     gpu: Option<GpuStage>,
+     meter: Meter,
++    /// The transfer last handed to the open output (`None`: not yet).
++    transfer: Option<OutputTransfer>,
+ }
+ 
+ impl Default for Transmit {
+     fn default() -> Self {
+-        Self { output: None, failed: false, last: None, gpu_allowed: true, gpu: None, meter: Meter::default() }
++        Self { output: None, failed: false, last: None, gpu_allowed: true, gpu: None, meter: Meter::default(), transfer: None }
+     }
+ }
+ 
+@@ -242,6 +248,7 @@ fn ensure_open(t: &mut Transmit, on: bool, opener: Option<&mut VideoOutputOpener
+         }
+         t.failed = false;
+         t.last = None;
++        t.transfer = None;
+         return false;
+     }
+     if t.output.is_none() && !t.failed {
+@@ -256,6 +263,7 @@ fn ensure_open(t: &mut Transmit, on: bool, opener: Option<&mut VideoOutputOpener
+                 t.gpu = if t.gpu_allowed { GpuStage::start(o.clone()) } else { None };
+                 t.output = Some(o);
+                 t.meter = Meter::default();
++                t.transfer = None;
+             }
+             Err(e) => {
+                 log::warn!("External Video Output is on but unavailable: {e}");
+@@ -277,6 +285,7 @@ pub fn update(app: &mut crate::FilmcraftApp, program: bool, p: ProgramFrame<'_>)
+     if !ensure_open(&mut app.transmit, on, app.hooks.open_video_output.as_mut()) {
+         return;
+     }
++    apply_transfer(&mut app.transmit, OutputTransfer::from_pref(&app.session.prefs.playback.transmit_gamma));
+     // while prerolling the clock has not started: the frame at the playhead, like paused
+     let playing = p.playing && app.playback.preroll.is_none();
+     let scale = crate::panels::monitor::quantize_scale(output_scale(p.frame_size.0, p.frame_size.1));
+@@ -320,6 +329,20 @@ pub fn update(app: &mut crate::FilmcraftApp, program: bool, p: ProgramFrame<'_>)
+     log_playing(&mut app.transmit, playing);
+ }
+ 
++/// Hand `want` to the open output when it changed; the current frame is then sent again.
++fn apply_transfer(t: &mut Transmit, want: OutputTransfer) {
++    if t.transfer == Some(want) {
++        return;
++    }
++    let Some(out) = &t.output else { return };
++    out.set_transfer(want);
++    if t.transfer.is_some() || want != OutputTransfer::default() {
++        log::info!("External Video Output: gamma {want:?}");
++    }
++    t.transfer = Some(want);
++    t.last = None;
++}
++
+ fn log_playing(t: &mut Transmit, playing: bool) {
+     if !playing {
+         t.meter.since = None;
+@@ -389,6 +412,27 @@ mod tests {
+         assert!(!ensure_open(&mut none, true, None));
+     }
+ 
++    #[test]
++    fn a_gamma_change_reaches_the_output_and_resends_the_frame() {
++        let mut opener: VideoOutputOpener = Box::new(|| Ok(Box::new(Fake(Arc::default())) as Box<dyn VideoOutput>));
++        let mut t = Transmit::default();
++        t.set_gpu(false);
++        assert!(ensure_open(&mut t, true, Some(&mut opener)));
++        apply_transfer(&mut t, OutputTransfer::default());
++        assert_eq!(t.transfer, Some(OutputTransfer::SrgbToBt1886), "BT.1886 by default");
++        t.last = Some(FrameKey { target: Target::Item(filmcraft_project::ItemId(1)), frame: 3, size: 1000, revision: 0, draft: false });
++        apply_transfer(&mut t, OutputTransfer::SrgbToBt1886);
++        assert!(t.last.is_some(), "no change: nothing is resent");
++        apply_transfer(&mut t, OutputTransfer::AsIs);
++        assert_eq!(t.transfer, Some(OutputTransfer::AsIs));
++        assert!(t.last.is_none(), "the current frame is sent again");
++        assert!(!ensure_open(&mut t, false, Some(&mut opener)));
++        assert_eq!(t.transfer, None, "a reopened output gets the transfer again");
++        assert_eq!(OutputTransfer::from_pref("srgbToBt1886"), OutputTransfer::SrgbToBt1886);
++        assert_eq!(OutputTransfer::from_pref("asIs"), OutputTransfer::AsIs);
++        assert_eq!(OutputTransfer::from_pref("bogus"), OutputTransfer::SrgbToBt1886);
++    }
++
+     #[test]
+     fn an_open_output_stays_open_until_turned_off() {
+         let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+diff --git a/docs/decklink-output.md b/docs/decklink-output.md
+index 51fa42ef..659425ca 100644
+--- a/docs/decklink-output.md
++++ b/docs/decklink-output.md
+@@ -72,6 +72,23 @@ the desktop app's features), so its GPU measurements would report "no off-screen
+    The card opens at once and shows the paused Program frame.
+ 4. Play as usual. Turning the setting off releases the card.
+ 
++### Gamma
++
++**Settings ▸ Playback ▸ External Video Output gamma** (just under the switch,
++`playback.transmitGamma`) says how FilmCraft's sRGB picture is encoded for the card:
++
++| Choice | What goes out |
++|---|---|
++| **sRGB to Rec.709 (BT.1886, gamma 2.4 monitor)** (default) | Each value decoded with the sRGB curve to linear light and re-encoded with gamma 1/2.4, so a BT.1886 display shows what an sRGB computer monitor shows. Black, white and the primaries are unchanged; mid grey (sRGB 128) goes out at Y' 132 instead of 126, a dark grey (sRGB 25) at 48 instead of 37. |
++| **As is (sRGB values unchanged)** | The sRGB code values as BT.709 code values. On a gamma 2.4 (BT.1886) monitor or TV the shadows look darker and the picture more contrasty than on the computer screen. |
++
++On the tested setup (DeckLink Mini Monitor HD to a Rec.709 TV), "sRGB to Rec.709" matched the
++reference picture from Avid Media Composer on the same TV and card. "As is" remains as an option.
++
++The change applies at once (the current frame is sent again), so the two can be compared live.
++Both are part of the conversion tables, so neither costs time. `decklink-test` uses the default
++too; `decklink-test --gamma asIs` sends the unchanged values.
++
+ Only one program can use the card's output at a time: close Media Express, DaVinci Resolve or a
+ running `filmcraft-cli decklink-test` first. If the card is missing or busy, FilmCraft logs one
+ warning (`External Video Output is on but unavailable: …`) and carries on; turn the setting off
+@@ -101,6 +118,9 @@ The card runs at exactly 25 frames per second. For smooth motion:
+ # a project frame (at 12 s) for 30 s
+ ./target/release/filmcraft-cli --project my.fcproj decklink-test --seconds 12 --hold 30
+ ./target/release/filmcraft-cli --demo decklink-test --hold 30   # the built-in demo project
++
++# the same frame with the sRGB values unchanged (Settings ▸ Playback ▸ External Video Output gamma)
++./target/release/filmcraft-cli --project my.fcproj decklink-test --seconds 12 --hold 30 --gamma asIs
+ ```
+ 
+ `decklink-test` exits with an error if the card is missing, busy or refuses the picture.
+-- 
+2.43.0
+

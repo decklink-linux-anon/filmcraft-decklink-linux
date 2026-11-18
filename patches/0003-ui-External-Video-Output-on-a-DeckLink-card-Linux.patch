@@ -1,0 +1,913 @@
+From dfd5d4fd3243cccf8d22645ca8769b4dc023e139 Mon Sep 17 00:00:00 2001
+From: decklink-linux-anon
+ <358323356+decklink-linux-anon@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:41:27 +0200
+Subject: [PATCH 3/7] ui: External Video Output on a DeckLink card (Linux)
+
+Settings > Playback > Enable External Video Output (playback.enableTransmit)
+now sends the Program monitor's sequence frame to the host's VideoOutput;
+the desktop app's is DeckLink device 0 at 1080p25 (apps/filmcraft
+video_out.rs). Elsewhere the setting stays greyed out as before.
+
+- ui-egui stays OS-independent: HostHooks::open_video_output and the
+  VideoOutput trait; transmit.rs owns the open output.
+- Frames are requested at the size that fits 1920x1080, through the frame
+  server like the monitors. Paused: the playhead frame is sent once.
+  Playing: the next frames are scheduled and each is sent once when ready.
+- GPU path (default): the workers plan and prepare frames for the
+  off-screen device; a transmit-gpu thread composites and reads them back
+  and hands them to the card. CPU compositor frames are the fallback.
+- A missing card or driver is logged once; the output is retried when the
+  setting is toggled. Turning it off releases the card.
+- While playing, a log line every 5 s gives frames sent / skipped and the
+  stage timings.
+
+Tests: transmit unit tests and tests/it/transmit_ui.rs (setting off, paused
+frame once at output size, playback, CPU fallback, GPU path, no card,
+release on toggle; an ignored throughput benchmark).
+---
+ apps/filmcraft/src/main.rs             |   3 +
+ apps/filmcraft/src/video_out.rs        |  41 +++
+ crates/engine/src/settings/schema.rs   |  12 +-
+ crates/engine/src/settings_tests.rs    |  11 +-
+ crates/ui-egui/src/app.rs              |   1 +
+ crates/ui-egui/src/hooks.rs            |  20 ++
+ crates/ui-egui/src/lib.rs              |  12 +-
+ crates/ui-egui/src/panels/monitor.rs   |   3 +
+ crates/ui-egui/src/panels/settings.rs  |   8 +-
+ crates/ui-egui/src/transmit.rs         | 404 +++++++++++++++++++++++++
+ crates/ui-egui/tests/it/main.rs        |   1 +
+ crates/ui-egui/tests/it/transmit_ui.rs | 185 +++++++++++
+ 12 files changed, 693 insertions(+), 8 deletions(-)
+ create mode 100644 apps/filmcraft/src/video_out.rs
+ create mode 100644 crates/ui-egui/src/transmit.rs
+ create mode 100644 crates/ui-egui/tests/it/transmit_ui.rs
+
+diff --git a/apps/filmcraft/src/main.rs b/apps/filmcraft/src/main.rs
+index f6e64eae..f983729e 100644
+--- a/apps/filmcraft/src/main.rs
++++ b/apps/filmcraft/src/main.rs
+@@ -38,6 +38,7 @@ mod logging;
+ mod native_color;
+ #[cfg(target_os = "macos")]
+ mod native_menu;
++mod video_out;
+ mod window_raise;
+ 
+ use args::{Cli, Launch};
+@@ -387,6 +388,8 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
+         // Keep device selection available even when the default device is unavailable.
+         // Settings ▸ Audio Hardware is applied on the first frame (`apply_prefs`).
+         app.audio = Some(Box::new(audio::CpalOut::new()));
++        // Settings ▸ Playback ▸ Enable External Video Output: a DeckLink card (Linux).
++        app.hooks.open_video_output = Some(Box::new(video_out::open));
+         // The scrub grain gets its own output on its own thread (#2633): opening a device stream
+         // can take ~0.6 s, which must never happen in a playhead-drag frame.
+         let document_rate = app.session.active_sequence().map(|q| q.settings.sample_rate);
+diff --git a/apps/filmcraft/src/video_out.rs b/apps/filmcraft/src/video_out.rs
+new file mode 100644
+index 00000000..2f30fa70
+--- /dev/null
++++ b/apps/filmcraft/src/video_out.rs
+@@ -0,0 +1,41 @@
++//! External Video Output for the desktop app: [`filmcraft_ui_egui::VideoOutput`] over a DeckLink
++//! card ([`filmcraft_platform::decklink`]).
++
++use std::sync::Arc;
++
++use filmcraft_platform::decklink;
++use filmcraft_ui_egui::VideoOutput;
++use filmcraft_ui_egui::frames::Rgba;
++
++/// A monitor frame handed to the output thread without copying.
++struct Picture(Arc<Rgba>);
++
++impl decklink::RgbaPicture for Picture {
++    fn size(&self) -> (usize, usize) {
++        (self.0.w, self.0.h)
++    }
++    fn rgba(&self) -> &[u8] {
++        &self.0.px
++    }
++}
++
++struct DeckLink(decklink::Output);
++
++impl VideoOutput for DeckLink {
++    fn name(&self) -> String {
++        self.0.name().to_string()
++    }
++    fn stats(&self) -> Option<String> {
++        let s = self.0.stats();
++        let per = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / s.shown.max(1) as f64;
++        Some(format!("card: {} shown, {} refused, UYVY {:.1} ms, push {:.1} ms per frame", s.shown, s.failed, per(s.convert), per(s.display)))
++    }
++    fn send(&self, frame: Arc<Rgba>) {
++        self.0.send(Arc::new(Picture(frame)));
++    }
++}
++
++/// Open DeckLink device 0 at 1080p25.
++pub fn open() -> Result<Box<dyn VideoOutput>, String> {
++    decklink::Output::open().map(|o| Box::new(DeckLink(o)) as Box<dyn VideoOutput>).map_err(|e| e.to_string())
++}
+diff --git a/crates/engine/src/settings/schema.rs b/crates/engine/src/settings/schema.rs
+index bfc714de..d89e29f0 100644
+--- a/crates/engine/src/settings/schema.rs
++++ b/crates/engine/src/settings/schema.rs
+@@ -62,7 +62,7 @@ pub struct Field {
+     /// Whether FilmCraft acts on the value (false = remembered for parity, no effect yet).
+     pub wired: bool,
+     /// Drawn greyed out with "This preference is not available yet.": the preference is remembered
+-    /// but there is nothing behind it yet (`playback.enableTransmit`).
++    /// but there is nothing behind it yet (`playback.enableTransmit` outside Linux).
+     pub unavailable: bool,
+ }
+ 
+@@ -110,6 +110,14 @@ const fn pending(key: &'static str, label: &'static str) -> Row {
+     Row::Field(Field { key, label, kind: Kind::Bool, indent: false, enabled_by: None, wired: false, unavailable: true })
+ }
+ 
++/// "Enable External Video Output": the Program picture on a Blackmagic DeckLink card, 1080p25
++/// (`filmcraft_platform::decklink`, Linux). Elsewhere it is remembered but has nothing behind it.
++const TRANSMIT: Row = if cfg!(target_os = "linux") {
++    b("playback.enableTransmit", "Enable External Video Output (Blackmagic DeckLink, 1080p25)", true)
++} else {
++    pending("playback.enableTransmit", "Enable External Video Output")
++};
++
+ const fn int(min: f64, max: f64, unit: &'static str) -> Kind {
+     Kind::Int { min, max, unit }
+ }
+@@ -530,7 +538,7 @@ pub(super) static CATEGORIES: &[Category] = &[
+             f("playback.postrollSeconds", "Postroll", float(0.0, 60.0, 0, "seconds"), true),
+             f("playback.stepManyFrames", "Step forward/back many", int(1.0, 1000.0, "frames"), true),
+             b("playback.pauseEncoderQueue", "Pause Media Encoder queue during playback", false),
+-            pending("playback.enableTransmit", "Enable External Video Output"),
++            TRANSMIT,
+             b("playback.disableVideoInBackground", "Disable video output when in the background", false),
+             b("playback.draftDecode", "Draft decoding at reduced playback resolution (H.264: faster, some frames less filtered)", true),
+             f("playback.hardwareDecoding", "Hardware decoding", Kind::Choice(HW_DECODE), true),
+diff --git a/crates/engine/src/settings_tests.rs b/crates/engine/src/settings_tests.rs
+index 41982daa..8ca0d89f 100644
+--- a/crates/engine/src/settings_tests.rs
++++ b/crates/engine/src/settings_tests.rs
+@@ -880,10 +880,15 @@ fn hardware_decoding_setting_drives_the_decoder_switch() {
+     set(&mut s, "playback.hardwareDecoding", json!("auto"));
+     assert!(filmcraft_codecs::hw::hardware_decoding());
+     assert!(settings::field("playback.hardwareDecoding").is_some_and(|f| f.wired && matches!(f.kind, Kind::Choice(_))));
+-    // External Video Output has nothing behind it yet: it stays in the schema and round-trips, and
+-    // the dialog greys it out with the "not available yet" hint instead of pretending it works.
++    // External Video Output is the DeckLink output on Linux. Elsewhere it has nothing behind it:
++    // it stays in the schema and round-trips, and the dialog greys it out with the "not available
++    // yet" hint instead of pretending it works.
+     let transmit = settings::field("playback.enableTransmit").expect("playback.enableTransmit");
+-    assert!(!transmit.wired && transmit.unavailable, "External Video Output must not claim to work");
++    if cfg!(target_os = "linux") {
++        assert!(transmit.wired && !transmit.unavailable, "DeckLink output is wired on Linux");
++    } else {
++        assert!(!transmit.wired && transmit.unavailable, "External Video Output must not claim to work");
++    }
+ }
+ 
+ /// Settings ▸ Timeline ▸ "Place files dropped onto the Timeline directly on the Timeline": on by default.
+diff --git a/crates/ui-egui/src/app.rs b/crates/ui-egui/src/app.rs
+index 3639ff05..d89e47f9 100644
+--- a/crates/ui-egui/src/app.rs
++++ b/crates/ui-egui/src/app.rs
+@@ -94,6 +94,7 @@ impl FilmcraftApp {
+             monitor_inexact: false,
+             monitor_asked: HashMap::new(),
+             program_shown: None,
++            transmit: Default::default(),
+             timeline_still: 0,
+             input_waiters: Vec::new(),
+             styled: false,
+diff --git a/crates/ui-egui/src/hooks.rs b/crates/ui-egui/src/hooks.rs
+index b1361298..a59c423b 100644
+--- a/crates/ui-egui/src/hooks.rs
++++ b/crates/ui-egui/src/hooks.rs
+@@ -32,6 +32,23 @@ pub trait AudioOut {
+     }
+ }
+ 
++/// External video output provided by the platform layer (a DeckLink card on Linux desktop):
++/// Settings ▸ Playback ▸ Enable External Video Output, see [`crate::transmit`].
++pub trait VideoOutput: Send + Sync {
++    /// The device's name, for the log.
++    fn name(&self) -> String;
++    /// Its own timings for the periodic log line, if it keeps any.
++    fn stats(&self) -> Option<String> {
++        None
++    }
++    /// Show `frame` (sRGB RGBA8 over black) as soon as possible, replacing one not shown yet.
++    /// Must not block the UI thread.
++    fn send(&self, frame: std::sync::Arc<crate::frames::Rgba>);
++}
++
++/// Opens the external video output, or says why it can't.
++pub type VideoOutputOpener = Box<dyn FnMut() -> Result<Box<dyn VideoOutput>, String>>;
++
+ /// What the platform audio layer can open (Settings ▸ Audio Hardware).
+ #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+ pub struct AudioDevices {
+@@ -46,6 +63,9 @@ pub struct AudioDevices {
+ /// Host hooks for native file dialogs etc.
+ #[derive(Default)]
+ pub struct HostHooks {
++    /// External video output (Settings ▸ Playback ▸ Enable External Video Output). Without it the
++    /// setting does nothing.
++    pub open_video_output: Option<VideoOutputOpener>,
+     /// Optional native custom-color editor; presets and project palette stay in FilmCraft.
+     pub pick_color: Option<crate::widgets::color_picker::NativeColorPicker>,
+     pub pick_files: Option<Box<dyn FnMut(&[&str]) -> Vec<String>>>,
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index a1ab10ab..164e815b 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -72,6 +72,7 @@ pub mod source_playback;
+ pub mod state;
+ pub mod theme;
+ mod theme_favorites;
++pub mod transmit;
+ pub mod updates_ui;
+ pub mod widgets;
+ 
+@@ -101,7 +102,7 @@ mod raw_input;
+ use audio::shuttle_mix_rate;
+ pub use audio::{AUDIO_RETRY_S, AUDIO_STALL_S, playback_mix};
+ pub use gpu::{gpu_compositor_unsupported, software_rasterizer};
+-pub use hooks::{AudioDevices, AudioOut, ClipboardMedia, HostHooks, RelinkHint, SystemThemeFn};
++pub use hooks::{AudioDevices, AudioOut, ClipboardMedia, HostHooks, RelinkHint, SystemThemeFn, VideoOutput, VideoOutputOpener};
+ pub(crate) use raw_input::rewrite_native_window_input;
+ 
+ pub use ime_reset::install_ime_reset_callbacks;
+@@ -328,6 +329,8 @@ pub struct FilmcraftApp {
+     pub(crate) monitor_asked: HashMap<String, std::collections::VecDeque<FrameKey>>,
+     /// The frame whose picture the Program monitor drew last: the frame due, or its stand-in.
+     pub(crate) program_shown: Option<FrameKey>,
++    /// External Video Output (DeckLink), see [`transmit`].
++    pub(crate) transmit: transmit::Transmit,
+     /// Consecutive frames the timeline zoom / scroll has been at rest. `ui.elements` answers from
+     /// the frame before the last one, so its timeline rects are final from 2 on.
+     pub(crate) timeline_still: u32,
+@@ -413,3 +416,10 @@ pub struct GpuState {
+     /// Largest texture side the device accepts.
+     pub max_texture: u32,
+ }
++
++impl FilmcraftApp {
++    /// External Video Output's state (tests, the desktop app).
++    pub fn transmit_mut(&mut self) -> &mut transmit::Transmit {
++        &mut self.transmit
++    }
++}
+diff --git a/crates/ui-egui/src/panels/monitor.rs b/crates/ui-egui/src/panels/monitor.rs
+index 0bed3260..0442ed5a 100644
+--- a/crates/ui-egui/src/panels/monitor.rs
++++ b/crates/ui-egui/src/panels/monitor.rs
+@@ -95,6 +95,9 @@ fn draw_picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, which: Which, mv: &cr
+     } else {
+         app.frames.request(key, rate.tick_of(frame), scale, &project, 0);
+     }
++    // External Video Output follows the Program monitor (see `transmit`)
++    let program = crate::transmit::ProgramFrame { target: cpu_target, frame, frame_size, rate, revision: rev, playing, speed, project: &project };
++    crate::transmit::update(app, which == Which::Program, program);
+     let asked = asked_before(app, prefix, key, playing);
+     let tex_name = if channel {
+         format!("monitor-{prefix}-{display:?}")
+diff --git a/crates/ui-egui/src/panels/settings.rs b/crates/ui-egui/src/panels/settings.rs
+index a68765c9..614be9c8 100644
+--- a/crates/ui-egui/src/panels/settings.rs
++++ b/crates/ui-egui/src/panels/settings.rs
+@@ -1095,8 +1095,12 @@ mod tests {
+     #[test]
+     fn unavailable_settings_are_drawn_greyed_out() {
+         let mut values = json!({"playback": {"enableTransmit": true}, "mediaCache": {"autoClean": false}});
+-        let transmit = settings::field("playback.enableTransmit").expect("playback.enableTransmit");
+-        assert!(!field_enabled(&transmit, &values), "External Video Output has nothing behind it");
++        // External Video Output is the DeckLink output on Linux; elsewhere it has nothing behind it.
++        // A field with nothing behind it is greyed out whatever its stored value.
++        let mut transmit = settings::field("playback.enableTransmit").expect("playback.enableTransmit");
++        assert_eq!(field_enabled(&transmit, &values), cfg!(target_os = "linux"));
++        transmit.unavailable = true;
++        assert!(!field_enabled(&transmit, &values), "a pending preference is not offered");
+         // The stored value is untouched: it round-trips, it just is not offered.
+         values["playback"]["enableTransmit"] = json!(true);
+         assert!(!field_enabled(&transmit, &values));
+diff --git a/crates/ui-egui/src/transmit.rs b/crates/ui-egui/src/transmit.rs
+new file mode 100644
+index 00000000..5af9e950
+--- /dev/null
++++ b/crates/ui-egui/src/transmit.rs
+@@ -0,0 +1,404 @@
++//! External Video Output (Settings ▸ Playback ▸ Enable External Video Output): the Program
++//! monitor's sequence frame on the host's [`VideoOutput`] (the desktop app's is a DeckLink card,
++//! `filmcraft_platform::decklink`, 1920 x 1080 25p).
++//!
++//! The card gets its own frame requests at the size that fits 1920 x 1080 (not the on-screen
++//! monitor's size), through the same [`FrameServer`](crate::frames::FrameServer) as the monitors.
++//!
++//! - **GPU path** (default where an off-screen GPU device opens): the frame workers decode and
++//!   plan the frames ([`Target::SequencePlan`] for that device's caps), and a thread of its own
++//!   ([`GpuStage`]) composites each plan on the off-screen device
++//!   ([`filmcraft_gpu::ExportRenderer::composite_rgba8`]), reads it back as sRGB RGBA8 and hands
++//!   it to the output, off the UI thread. About 5–10 ms a 1080p frame instead of ~60 ms on the CPU.
++//! - **CPU path** (fallback: no GPU, the device failed, or [`Transmit::set_gpu`] off): the CPU
++//!   compositor's sRGB frames ([`Target::Sequence`]).
++//!
++//! Paused, the frame at the playhead is requested and sent when ready; while playing, the next
++//! frames are scheduled like the monitor's and each frame is sent once, when it is ready (a frame
++//! not ready in time is skipped and the card holds the previous one). Opening the card happens
++//! when the setting is turned on; a missing card or driver is logged once and the output stays off
++//! until the setting is turned off and on again. While playing, a line with the frame counts and
++//! timings is logged every 5 s (`External Video Output: …`).
++
++use std::sync::{Arc, Condvar, Mutex, PoisonError};
++use std::time::{Duration, Instant};
++
++use filmcraft_project::Project;
++use filmcraft_render::plan::DeviceCaps;
++use filmcraft_time::FrameRate;
++
++use crate::frames::{FrameKey, GpuPlan, PLAYING_REVISION_LAG, Rgba, Target};
++use crate::hooks::{VideoOutput, VideoOutputOpener};
++
++/// The output frame size.
++pub const OUTPUT_SIZE: (u32, u32) = (1920, 1080);
++
++/// The open card, if any, and what it shows.
++pub struct Transmit {
++    output: Option<Arc<dyn VideoOutput>>,
++    /// Opening failed; not retried until the setting is turned off and on again.
++    failed: bool,
++    /// The frame last sent.
++    last: Option<FrameKey>,
++    /// Use the GPU path when it is available.
++    gpu_allowed: bool,
++    gpu: Option<GpuStage>,
++    meter: Meter,
++}
++
++impl Default for Transmit {
++    fn default() -> Self {
++        Self { output: None, failed: false, last: None, gpu_allowed: true, gpu: None, meter: Meter::default() }
++    }
++}
++
++impl Transmit {
++    /// Whether a card is open.
++    pub fn active(&self) -> bool {
++        self.output.is_some()
++    }
++
++    /// Allow the GPU path (on by default); off sends CPU-rendered frames. Takes effect the next
++    /// time the output opens.
++    pub fn set_gpu(&mut self, on: bool) {
++        self.gpu_allowed = on;
++    }
++
++    /// Whether frames go through the GPU path now (`None`: its device is still opening).
++    pub fn uses_gpu(&self) -> Option<bool> {
++        match &self.gpu {
++            None => Some(false),
++            Some(g) => g.caps().map(|c| c.is_some()),
++        }
++    }
++
++    /// Frames sent while playing since the output opened, and frames skipped (not ready in time).
++    pub fn counts(&self) -> (u64, u64) {
++        (self.meter.total_sent, self.meter.total_skipped)
++    }
++}
++
++/// Frames sent and skipped while playing, logged every few seconds.
++#[derive(Default)]
++struct Meter {
++    since: Option<Instant>,
++    sent: u64,
++    skipped: u64,
++    total_sent: u64,
++    total_skipped: u64,
++}
++
++impl Meter {
++    const EVERY: Duration = Duration::from_secs(5);
++
++    fn frame(&mut self, prev: Option<FrameKey>, k: FrameKey, playing: bool) {
++        if !playing {
++            self.since = None;
++            return;
++        }
++        let gap = prev.map(|p| (k.frame - p.frame).unsigned_abs().saturating_sub(1)).unwrap_or(0);
++        self.sent += 1;
++        self.skipped += gap;
++        self.total_sent += 1;
++        self.total_skipped += gap;
++    }
++
++    fn log(&mut self, path: &str, extra: Option<String>) {
++        let now = Instant::now();
++        let Some(since) = self.since else {
++            self.since = Some(now);
++            return;
++        };
++        if now - since < Self::EVERY {
++            return;
++        }
++        let secs = (now - since).as_secs_f64();
++        log::info!(
++            "External Video Output ({path}): {:.1} frames/s sent, {} skipped in {secs:.1} s{}",
++            self.sent as f64 / secs,
++            self.skipped,
++            extra.map(|e| format!("; {e}")).unwrap_or_default()
++        );
++        (self.since, self.sent, self.skipped) = (Some(now), 0, 0);
++    }
++}
++
++#[derive(Default)]
++struct GpuSlot {
++    latest: Option<Arc<GpuPlan>>,
++    quit: bool,
++    /// The off-screen device's caps once it opened; `Some(None)` when it could not.
++    caps: Option<Option<DeviceCaps>>,
++    composited: u64,
++    busy: Duration,
++}
++
++/// The GPU path's thread: composites the newest plan on an off-screen device and sends it.
++struct GpuStage {
++    shared: Arc<(Mutex<GpuSlot>, Condvar)>,
++    thread: Option<std::thread::JoinHandle<()>>,
++}
++
++impl GpuStage {
++    fn start(output: Arc<dyn VideoOutput>) -> Option<Self> {
++        let shared: Arc<(Mutex<GpuSlot>, Condvar)> = Arc::default();
++        let worker = shared.clone();
++        let thread = std::thread::Builder::new().name("transmit-gpu".into()).spawn(move || gpu_thread(&worker, &*output)).ok()?;
++        Some(Self { shared, thread: Some(thread) })
++    }
++
++    fn slot(&self) -> std::sync::MutexGuard<'_, GpuSlot> {
++        self.shared.0.lock().unwrap_or_else(PoisonError::into_inner)
++    }
++
++    /// `None` while the device opens; then its caps, or `Some(None)` if it failed.
++    fn caps(&self) -> Option<Option<DeviceCaps>> {
++        self.slot().caps
++    }
++
++    fn send(&self, plan: Arc<GpuPlan>) {
++        self.slot().latest = Some(plan);
++        self.shared.1.notify_one();
++    }
++
++    fn timing(&self) -> String {
++        let s = self.slot();
++        format!("GPU composite + read-back {:.1} ms/frame", s.busy.as_secs_f64() * 1000.0 / s.composited.max(1) as f64)
++    }
++}
++
++impl Drop for GpuStage {
++    fn drop(&mut self) {
++        self.slot().quit = true;
++        self.shared.1.notify_one();
++        if let Some(t) = self.thread.take() {
++            let _ = t.join();
++        }
++    }
++}
++
++fn gpu_thread(shared: &(Mutex<GpuSlot>, Condvar), output: &dyn VideoOutput) {
++    let lock = || shared.0.lock().unwrap_or_else(PoisonError::into_inner);
++    let mut renderer = filmcraft_gpu::ExportRenderer::new();
++    lock().caps = Some(renderer.as_ref().map(filmcraft_gpu::ExportRenderer::caps));
++    let Some(r) = renderer.as_mut() else {
++        log::info!("External Video Output: no off-screen GPU device, rendering on the CPU");
++        return;
++    };
++    loop {
++        let plan = {
++            let mut slot = lock();
++            loop {
++                if slot.quit {
++                    return;
++                }
++                if let Some(p) = slot.latest.take() {
++                    break p;
++                }
++                slot = shared.1.wait(slot).unwrap_or_else(PoisonError::into_inner);
++            }
++        };
++        let t0 = Instant::now();
++        let Some((w, h, px)) = r.composite_rgba8(&plan.plan, &plan.prepared) else {
++            log::warn!("External Video Output: the GPU device failed, rendering on the CPU");
++            lock().caps = Some(None);
++            return;
++        };
++        {
++            let mut slot = lock();
++            slot.composited += 1;
++            slot.busy += t0.elapsed();
++        }
++        output.send(Arc::new(Rgba { w: w as usize, h: h as usize, px }));
++    }
++}
++
++/// The render scale that fits a `w` x `h` sequence inside 1920 x 1080 (never above 1).
++pub fn output_scale(w: u32, h: u32) -> f32 {
++    let (w, h) = (w.max(1) as f32, h.max(1) as f32);
++    (OUTPUT_SIZE.0 as f32 / w).min(OUTPUT_SIZE.1 as f32 / h).min(1.0)
++}
++
++/// What the Program monitor shows this refresh.
++pub struct ProgramFrame<'a> {
++    /// The monitor's CPU target: only a sequence ([`Target::Sequence`]) is sent.
++    pub target: Target,
++    pub frame: i64,
++    pub frame_size: (u32, u32),
++    pub rate: FrameRate,
++    pub revision: u64,
++    pub playing: bool,
++    pub speed: f64,
++    pub project: &'a Arc<Project>,
++}
++
++/// Open or close the output as the setting says (`on`). Returns whether it is open.
++fn ensure_open(t: &mut Transmit, on: bool, opener: Option<&mut VideoOutputOpener>) -> bool {
++    if !on {
++        // the GPU thread holds the output too: stop it first, so dropping ours releases the card
++        t.gpu = None;
++        if t.output.take().is_some() {
++            log::info!("External Video Output: closed the DeckLink output");
++        }
++        t.failed = false;
++        t.last = None;
++        return false;
++    }
++    if t.output.is_none() && !t.failed {
++        let opened = match opener {
++            Some(open) => open(),
++            None => Err("this build has no external video output".to_string()),
++        };
++        match opened {
++            Ok(o) => {
++                log::info!("External Video Output: {} at 1080p25", o.name());
++                let o: Arc<dyn VideoOutput> = Arc::from(o);
++                t.gpu = if t.gpu_allowed { GpuStage::start(o.clone()) } else { None };
++                t.output = Some(o);
++                t.meter = Meter::default();
++            }
++            Err(e) => {
++                log::warn!("External Video Output is on but unavailable: {e}");
++                t.failed = true;
++            }
++        }
++    }
++    t.output.is_some()
++}
++
++/// Called by the monitors every refresh (`program`: this is the Program monitor): request the
++/// output's frame and send it to the card once it is ready.
++pub fn update(app: &mut crate::FilmcraftApp, program: bool, p: ProgramFrame<'_>) {
++    let Target::Sequence(seq) = p.target else { return };
++    if !program {
++        return;
++    }
++    let on = app.session.prefs.playback.enable_transmit;
++    if !ensure_open(&mut app.transmit, on, app.hooks.open_video_output.as_mut()) {
++        return;
++    }
++    // while prerolling the clock has not started: the frame at the playhead, like paused
++    let playing = p.playing && app.playback.preroll.is_none();
++    let scale = crate::panels::monitor::quantize_scale(output_scale(p.frame_size.0, p.frame_size.1));
++    let size = (scale * 1000.0) as u32;
++    // the GPU path while its device is open (or still opening: nothing is sent meanwhile)
++    let gpu = app.transmit.gpu.as_ref().map(GpuStage::caps);
++    let target = match gpu {
++        Some(Some(Some(caps))) => Target::SequencePlan(seq, caps),
++        Some(None) => return,
++        _ => Target::Sequence(seq),
++    };
++    let key = FrameKey { target, frame: p.frame, size, revision: p.revision, draft: false };
++    if playing {
++        app.frames.schedule_playback(key, p.rate, scale, p.project, p.speed, false);
++    } else {
++        app.frames.request(key, p.rate.tick_of(p.frame), scale, p.project, 0);
++    }
++    let dir = if p.speed < 0.0 { -1 } else { 1 };
++    let ready = |k: &FrameKey| app.frames.is_ready(k);
++    let shown = if ready(&key) {
++        Some(key)
++    } else if playing {
++        app.frames.recent(key, dir, 6, PLAYING_REVISION_LAG)
++    } else {
++        None
++    };
++    let Some(k) = shown.filter(|k| app.transmit.last != Some(*k)) else {
++        log_playing(&mut app.transmit, playing);
++        return;
++    };
++    let sent = match (&app.transmit.gpu, &app.transmit.output) {
++        (Some(g), _) if matches!(k.target, Target::SequencePlan(..)) => app.frames.get_plan(&k).map(|plan| g.send(plan)).is_some(),
++        (_, Some(out)) => app.frames.get(&k).map(|frame| out.send(frame)).is_some(),
++        _ => false,
++    };
++    if sent {
++        let t = &mut app.transmit;
++        t.meter.frame(t.last, k, playing);
++        t.last = Some(k);
++    }
++    log_playing(&mut app.transmit, playing);
++}
++
++fn log_playing(t: &mut Transmit, playing: bool) {
++    if !playing {
++        t.meter.since = None;
++        return;
++    }
++    let (path, extra) = match &t.gpu {
++        Some(g) if matches!(g.caps(), Some(Some(_))) => ("GPU", Some(g.timing())),
++        _ => ("CPU", None),
++    };
++    let extra = [extra, t.output.as_ref().and_then(|o| o.stats())].into_iter().flatten().collect::<Vec<_>>();
++    t.meter.log(path, (!extra.is_empty()).then(|| extra.join("; ")));
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn output_scale_fits_1080() {
++        assert_eq!(output_scale(1920, 1080), 1.0);
++        assert_eq!(output_scale(3840, 2160), 0.5);
++        assert_eq!(output_scale(1280, 720), 1.0, "smaller sequences are not rendered larger");
++        assert_eq!(output_scale(1080, 1920), 0.5625);
++        assert!(output_scale(0, 0) <= 1.0);
++    }
++
++    #[test]
++    fn turning_the_setting_off_closes_and_clears_a_failure() {
++        let mut t = Transmit {
++            output: None,
++            failed: true,
++            last: Some(FrameKey { target: Target::Item(filmcraft_project::ItemId(1)), frame: 0, size: 1000, revision: 0, draft: false }),
++            ..Transmit::default()
++        };
++        assert!(!ensure_open(&mut t, false, None));
++        assert!(!t.failed && t.last.is_none() && !t.active());
++    }
++
++    struct Fake(Arc<std::sync::atomic::AtomicUsize>);
++
++    impl VideoOutput for Fake {
++        fn name(&self) -> String {
++            "fake".into()
++        }
++        fn send(&self, _frame: Arc<crate::frames::Rgba>) {
++            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
++    }
++
++    #[test]
++    fn a_failed_open_is_tried_once_until_the_setting_is_toggled() {
++        let tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++        let counted = tries.clone();
++        let mut opener: VideoOutputOpener = Box::new(move || {
++            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            Err("no card".into())
++        });
++        let mut t = Transmit::default();
++        assert!(!ensure_open(&mut t, true, Some(&mut opener)));
++        assert!(!ensure_open(&mut t, true, Some(&mut opener)));
++        assert_eq!(tries.load(std::sync::atomic::Ordering::Relaxed), 1, "logged and tried once");
++        ensure_open(&mut t, false, Some(&mut opener));
++        assert!(!ensure_open(&mut t, true, Some(&mut opener)));
++        assert_eq!(tries.load(std::sync::atomic::Ordering::Relaxed), 2, "turning it on again retries");
++        // no host output at all: off, quietly
++        let mut none = Transmit::default();
++        assert!(!ensure_open(&mut none, true, None));
++    }
++
++    #[test]
++    fn an_open_output_stays_open_until_turned_off() {
++        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++        let s2 = sent.clone();
++        let mut opener: VideoOutputOpener = Box::new(move || Ok(Box::new(Fake(s2.clone())) as Box<dyn VideoOutput>));
++        let mut t = Transmit::default();
++        t.set_gpu(false);
++        assert!(ensure_open(&mut t, true, Some(&mut opener)) && t.active());
++        assert_eq!(t.uses_gpu(), Some(false));
++        assert!(ensure_open(&mut t, true, Some(&mut opener)));
++        assert!(!ensure_open(&mut t, false, Some(&mut opener)) && !t.active());
++    }
++}
+diff --git a/crates/ui-egui/tests/it/main.rs b/crates/ui-egui/tests/it/main.rs
+index 4dbf2a53..9cf2812a 100644
+--- a/crates/ui-egui/tests/it/main.rs
++++ b/crates/ui-egui/tests/it/main.rs
+@@ -95,6 +95,7 @@ mod transcript_ui;
+ mod transform_handles_ui;
+ mod transition_drop_ui;
+ mod transitions_ui;
++mod transmit_ui;
+ mod tts_ui;
+ mod ui_control_input;
+ mod ui_dock_resize;
+diff --git a/crates/ui-egui/tests/it/transmit_ui.rs b/crates/ui-egui/tests/it/transmit_ui.rs
+new file mode 100644
+index 00000000..c1487930
+--- /dev/null
++++ b/crates/ui-egui/tests/it/transmit_ui.rs
+@@ -0,0 +1,185 @@
++//! External Video Output (Settings ▸ Playback ▸ Enable External Video Output): the Program
++//! monitor's frames reach the host's video output at the output size, paused and while playing;
++//! with the setting off, or with no card, nothing is opened and nothing fails.
++
++use std::sync::{Arc, Mutex};
++
++use egui_kittest::Harness;
++use filmcraft_engine::Session;
++use filmcraft_time::Tick;
++use filmcraft_ui_egui::frames::Rgba;
++use filmcraft_ui_egui::{FilmcraftApp, VideoOutput, VideoOutputOpener};
++use serde_json::json;
++
++#[derive(Default)]
++struct Log {
++    opened: usize,
++    closed: usize,
++    /// (width, height, first pixel) of each frame sent
++    frames: Vec<(usize, usize, [u8; 4])>,
++}
++
++struct FakeCard(Arc<Mutex<Log>>);
++
++impl VideoOutput for FakeCard {
++    fn name(&self) -> String {
++        "fake card".into()
++    }
++    fn send(&self, frame: Arc<Rgba>) {
++        let px = [frame.px[0], frame.px[1], frame.px[2], frame.px[3]];
++        self.0.lock().unwrap().frames.push((frame.w, frame.h, px));
++    }
++}
++
++impl Drop for FakeCard {
++    fn drop(&mut self) {
++        self.0.lock().unwrap().closed += 1;
++    }
++}
++
++fn opener(log: &Arc<Mutex<Log>>, works: bool) -> VideoOutputOpener {
++    let log = log.clone();
++    Box::new(move || {
++        log.lock().unwrap().opened += 1;
++        if works { Ok(Box::new(FakeCard(log.clone())) as Box<dyn VideoOutput>) } else { Err("no DeckLink device found".into()) }
++    })
++}
++
++fn harness(on: bool, works: bool) -> (Harness<'static, FilmcraftApp>, Arc<Mutex<Log>>) {
++    harness_gpu(on, works, true)
++}
++
++fn harness_gpu(on: bool, works: bool, gpu: bool) -> (Harness<'static, FilmcraftApp>, Arc<Mutex<Log>>) {
++    let mut s = Session::default();
++    s.execute("file.openDemoProject", json!({})).unwrap();
++    s.set_playhead(Tick::ZERO);
++    s.prefs.playback.enable_transmit = on;
++    let log = Arc::new(Mutex::new(Log::default()));
++    let mut app = FilmcraftApp::new(s);
++    app.hooks.open_video_output = Some(opener(&log, works));
++    app.transmit_mut().set_gpu(gpu);
++    let h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_step_dt(0.04).build_eframe(move |_cc| app);
++    (h, log)
++}
++
++/// Step (real time passes for the frame workers) until `done` or ~20 s.
++fn step_until(h: &mut Harness<'static, FilmcraftApp>, log: &Arc<Mutex<Log>>, done: impl Fn(&Log) -> bool) {
++    for _ in 0..1000 {
++        h.step();
++        if done(&log.lock().unwrap()) {
++            return;
++        }
++        std::thread::sleep(std::time::Duration::from_millis(20));
++    }
++}
++
++#[test]
++fn with_the_setting_off_nothing_is_opened() {
++    let (mut h, log) = harness(false, true);
++    for _ in 0..10 {
++        h.step();
++    }
++    let l = log.lock().unwrap();
++    assert_eq!((l.opened, l.frames.len()), (0, 0));
++}
++
++#[test]
++fn the_paused_frame_is_sent_once_at_output_size() {
++    let (mut h, log) = harness(true, true);
++    step_until(&mut h, &log, |l| !l.frames.is_empty());
++    for _ in 0..20 {
++        h.step();
++    }
++    let seq = h.state().session.active_sequence().map(|q| (q.settings.width as usize, q.settings.height as usize)).unwrap();
++    let l = log.lock().unwrap();
++    assert_eq!(l.opened, 1);
++    assert_eq!(l.frames.len(), 1, "a paused frame is sent once, not every refresh");
++    let (w, h) = (l.frames[0].0, l.frames[0].1);
++    assert!(w <= 1920 && h <= 1080 && (w == 1920.min(seq.0) || h == 1080.min(seq.1)), "{w}x{h} for a {}x{} sequence", seq.0, seq.1);
++}
++
++#[test]
++fn playing_sends_successive_frames_and_turning_off_closes() {
++    let (mut h, log) = harness(true, true);
++    step_until(&mut h, &log, |l| !l.frames.is_empty());
++    h.state_mut().play(1.0);
++    step_until(&mut h, &log, |l| l.frames.len() >= 6);
++    assert!(log.lock().unwrap().frames.len() >= 6, "frames follow playback");
++    h.state_mut().stop();
++    h.state_mut().session.prefs.playback.enable_transmit = false;
++    h.step();
++    let l = log.lock().unwrap();
++    assert_eq!((l.opened, l.closed), (1, 1), "turning the setting off releases the card");
++}
++
++#[test]
++fn without_a_card_the_output_is_tried_once_and_the_app_goes_on() {
++    let (mut h, log) = harness(true, false);
++    for _ in 0..30 {
++        h.step();
++    }
++    assert_eq!(log.lock().unwrap().opened, 1);
++    assert!(h.state().session.active_sequence().is_some());
++}
++
++/// Step until the output has sent `n` frames while playing, or ~30 s of real time pass (the
++/// suite runs many tests in parallel, so a fixed time window would measure the machine's load).
++fn play_until_sent(h: &mut Harness<'static, FilmcraftApp>, n: u64) -> (u64, u64) {
++    h.state_mut().play(1.0);
++    let t0 = std::time::Instant::now();
++    while h.state_mut().transmit_mut().counts().0 < n && t0.elapsed() < std::time::Duration::from_secs(30) {
++        h.step();
++        std::thread::sleep(std::time::Duration::from_millis(16));
++    }
++    h.state_mut().stop();
++    h.state_mut().transmit_mut().counts()
++}
++
++/// The CPU fallback (no GPU device, or the GPU path turned off) still sends paused and playing
++/// frames, each a later frame than the one before.
++#[test]
++fn the_cpu_fallback_sends_frames_too() {
++    let (mut h, log) = harness_gpu(true, true, false);
++    step_until(&mut h, &log, |l| !l.frames.is_empty());
++    assert_eq!(h.state_mut().transmit_mut().uses_gpu(), Some(false));
++    let (sent, skipped) = play_until_sent(&mut h, 8);
++    assert!(sent >= 8, "frames follow playback on the CPU path: {sent} sent, {skipped} skipped");
++}
++
++/// Where this machine has an off-screen GPU, playing goes through the GPU path: plans are
++/// composited off the UI thread and successive frames reach the output.
++#[test]
++fn playing_uses_the_gpu_path_where_there_is_a_gpu() {
++    let (mut h, log) = harness(true, true);
++    step_until(&mut h, &log, |l| !l.frames.is_empty());
++    if h.state_mut().transmit_mut().uses_gpu() != Some(true) {
++        eprintln!("no off-screen GPU device: skipped");
++        return;
++    }
++    let (sent, skipped) = play_until_sent(&mut h, 24);
++    assert!(sent >= 24, "{sent} sent, {skipped} skipped");
++    let l = log.lock().unwrap();
++    assert!(l.frames.iter().all(|f| f.0 <= 1920 && f.1 <= 1080), "output-sized frames");
++}
++
++/// Benchmark (run alone, on an idle machine: `cargo test --release -p filmcraft-ui-egui --test it
++/// transmit_ui::bench -- --ignored --nocapture`): 3 s of real playback of the demo project at
++/// 1080p on each path; the GPU path should send every frame (0 skipped).
++#[test]
++#[ignore = "timing benchmark: needs an idle machine"]
++fn bench_playback_throughput() {
++    for gpu in [false, true] {
++        let (mut h, log) = harness_gpu(true, true, gpu);
++        step_until(&mut h, &log, |l| !l.frames.is_empty());
++        let used = h.state_mut().transmit_mut().uses_gpu();
++        h.state_mut().play(1.0);
++        let t0 = std::time::Instant::now();
++        while t0.elapsed() < std::time::Duration::from_secs(3) {
++            h.step();
++            std::thread::sleep(std::time::Duration::from_millis(16));
++        }
++        h.state_mut().stop();
++        let (sent, skipped) = h.state_mut().transmit_mut().counts();
++        eprintln!("{} path: {sent} frames sent, {skipped} skipped in 3 s", if used == Some(true) { "GPU" } else { "CPU" });
++    }
++}
+-- 
+2.43.0
+

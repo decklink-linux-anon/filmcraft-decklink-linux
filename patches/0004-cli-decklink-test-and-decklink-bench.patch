@@ -1,0 +1,182 @@
+From c360ce5ffdca018703a27ffd79c3fdc39d2af891 Mon Sep 17 00:00:00 2001
+From: decklink-linux-anon
+ <358323356+decklink-linux-anon@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:41:27 +0200
+Subject: [PATCH 4/7] cli: decklink-test and decklink-bench
+
+decklink-test shows 75 % bars (or a --project / --demo frame at
+--seconds) on DeckLink device 0 for --hold seconds and fails if the card
+refuses it: a check of the card and TV without the desktop app.
+
+decklink-bench times External Video Output's stages over --frames frames:
+CPU render, GPU composite + read-back, UYVY conversion and (unless
+--no-card) 25 fps output on the card.
+---
+ apps/filmcraft-cli/src/args.rs |   1 +
+ apps/filmcraft-cli/src/main.rs | 124 +++++++++++++++++++++++++++++++++
+ 2 files changed, 125 insertions(+)
+
+diff --git a/apps/filmcraft-cli/src/args.rs b/apps/filmcraft-cli/src/args.rs
+index cc6e81cf..fb38294c 100644
+--- a/apps/filmcraft-cli/src/args.rs
++++ b/apps/filmcraft-cli/src/args.rs
+@@ -23,6 +23,7 @@ const VALUED: &[&str] = &[
+     "--data-dir",
+     "--settings",
+     "--gpu-rendering",
++    "--hold",
+ ];
+ 
+ #[derive(Debug, Default)]
+diff --git a/apps/filmcraft-cli/src/main.rs b/apps/filmcraft-cli/src/main.rs
+index 41a13062..c4f67327 100644
+--- a/apps/filmcraft-cli/src/main.rs
++++ b/apps/filmcraft-cli/src/main.rs
+@@ -94,6 +94,15 @@ SUBCOMMANDS
+   export --list-presets [query] list export presets (name, category, format) as JSON
+   render --seconds S --out f.png [--scale 0.5] [--allow-offline]
+                                 render one Program frame to PNG (offline media: as for export)
++  decklink-bench [--seconds S] [--frames N] [--no-card]
++                                time External Video Output's stages over N frames (default 50)
++                                of the --project / --demo sequence from S: CPU render, GPU
++                                composite + read-back, UYVY conversion, and (unless --no-card)
++                                25 fps output on DeckLink device 0
++  decklink-test [--seconds S] [--hold N] [--scale f]
++                                show a picture on DeckLink device 0 (1080p25, Linux) for N
++                                seconds (default 10): with --project / --demo the Program frame
++                                at S, otherwise 75 % colour bars
+   probe <media> [--image-sequence]
+                                 media info as JSON, with MXF / Ogg / BWF details; with
+                                 --image-sequence <media> is the first numbered still of a sequence
+@@ -333,6 +342,8 @@ async fn cli() {
+         "import" => cli_import(&a).await,
+         "export" => cli_export(&a).await,
+         "render" => cli_render(&a).await,
++        "decklink-test" => cli_decklink_test(&a).await,
++        "decklink-bench" => cli_decklink_bench(&a),
+         "mcp" => cli_mcp(&a).await,
+         other => usage(format!("unknown subcommand `{other}`")),
+     }
+@@ -547,6 +558,119 @@ async fn cli_render(a: &Args) {
+     diag(format_args!("rendered {}x{} in {:.1} ms → {out}", img.w, img.h, dt.as_secs_f64() * 1000.0));
+ }
+ 
++/// `decklink-test`: check the DeckLink output (and the TV behind it) without the desktop app.
++async fn cli_decklink_test(a: &Args) {
++    use filmcraft_platform::decklink;
++    if a.opt("--bridge").is_some() {
++        usage("decklink-test is headless; in the app turn on Settings ▸ Playback ▸ Enable External Video Output");
++    }
++    let hold: f64 = finite_opt::<f64>(a, "--hold").unwrap_or(10.0).clamp(0.0, 24.0 * 3600.0);
++    let picture: std::sync::Arc<dyn decklink::RgbaPicture> = if a.opt("--project").is_some() || a.flag("--demo") {
++        let Backend::Local(mut s) = Backend::open(a) else { usage("decklink-test is headless") };
++        let secs: f64 = finite_opt(a, "--seconds").unwrap_or(0.0);
++        let scale: f32 = finite_opt(a, "--scale").unwrap_or(1.0);
++        s.set_playhead(filmcraft_time::Tick::from_seconds_f64(secs));
++        let (img, offline) = render_at_playhead(&s, scale).unwrap_or_else(|e| fail(e));
++        let offline: Vec<Value> = offline.iter().filter_map(|o| serde_json::to_value(o).ok()).collect();
++        check_offline(a, &offline, "decklink-test");
++        std::sync::Arc::new(decklink::OwnedRgba { width: img.w, height: img.h, pixels: img.over_black_rgba8() })
++    } else {
++        std::sync::Arc::new(decklink::color_bars(decklink::WIDTH, decklink::HEIGHT))
++    };
++    let out = decklink::Output::open().unwrap_or_else(|e| fail(format!("decklink-test: {e}")));
++    let (w, h) = picture.size();
++    diag(format_args!("decklink-test: showing a {w}x{h} picture on {} (1080p25) for {hold:.0} s", out.name()));
++    out.send(picture);
++    std::thread::sleep(std::time::Duration::from_secs_f64(hold));
++    let (shown, failed) = out.counts();
++    drop(out);
++    if shown == 0 || failed > 0 {
++        fail(format!("decklink-test: the card took {shown} picture(s) and refused {failed}"));
++    }
++    diag(format_args!("decklink-test: done ({shown} picture shown)"));
++}
++
++/// `decklink-bench`: where External Video Output's time goes, per frame.
++fn cli_decklink_bench(a: &Args) {
++    use filmcraft_platform::decklink;
++    use std::time::{Duration, Instant};
++    let Backend::Local(mut s) = Backend::open(a) else { usage("decklink-bench is headless") };
++    let active = s.active_sequence().map(|q| q as *const _);
++    let Some(seq) = s.project.sequences().map(|i| i.id).find(|id| s.project.sequence(*id).map(|q| q as *const _) == active) else {
++        usage("decklink-bench needs --project or --demo")
++    };
++    let (w, h, rate) = s.active_sequence().map(|q| (q.settings.width, q.settings.height, q.settings.frame_rate)).unwrap_or_else(|| usage("no sequence"));
++    let n: i64 = finite_opt::<f64>(a, "--frames").unwrap_or(50.0).clamp(1.0, 10_000.0) as i64;
++    let start = rate.frame_at(filmcraft_time::Tick::from_seconds_f64(finite_opt::<f64>(a, "--seconds").unwrap_or(0.0)));
++    let scale = (decklink::WIDTH as f32 / w.max(1) as f32).min(decklink::HEIGHT as f32 / h.max(1) as f32).min(1.0);
++    let ms = |d: Duration, n: i64| d.as_secs_f64() * 1000.0 / n.max(1) as f64;
++    outln!("sequence {w}x{h} @ {:.3} fps, output scale {scale}, {n} frames from frame {start}", rate.as_f64());
++    // 1. CPU render (the first version's path)
++    let mut cpu = Duration::ZERO;
++    let mut last = None;
++    for f in start..start + n {
++        s.set_playhead(rate.tick_of(f));
++        let t = Instant::now();
++        let (img, _) = render_at_playhead(&s, scale).unwrap_or_else(|e| fail(e));
++        let px = img.over_black_rgba8();
++        cpu += t.elapsed();
++        last = Some((img.w, img.h, px));
++    }
++    outln!("cpu render + rgba8:      {:7.2} ms/frame", ms(cpu, n));
++    // 2. GPU composite + read-back on the off-screen device
++    match filmcraft_gpu::ExportRenderer::new() {
++        Some(mut r) => {
++            let provider = s.media.provider(s.project.clone(), s.services.clone());
++            let opts = filmcraft_render::RenderOptions { scale, captions: true, ..Default::default() };
++            let mut gpu = Duration::ZERO;
++            for f in start..start + n {
++                let t = Instant::now();
++                let out = r.render_rgba8(&s.project, seq, rate.tick_of(f), opts, &provider);
++                gpu += t.elapsed();
++                if out.is_none() {
++                    outln!("gpu: frame {f} fell back (device failed)");
++                }
++            }
++            outln!("gpu plan+composite+read: {:7.2} ms/frame (decode included)", ms(gpu, n));
++        }
++        None => outln!("gpu: no off-screen device"),
++    }
++    // 3. conversion alone
++    let (lw, lh, px) = last.unwrap_or((1, 1, vec![0; 4]));
++    let mut uyvy = vec![0u8; decklink::ROW_BYTES * decklink::HEIGHT];
++    let t = Instant::now();
++    for _ in 0..n {
++        decklink::rgba_to_uyvy(&px, lw, lh, &mut uyvy, decklink::WIDTH, decklink::HEIGHT);
++    }
++    outln!("rgba -> uyvy:            {:7.2} ms/frame", ms(t.elapsed(), n));
++    // 4. the card at 25 fps
++    if a.flag("--no-card") {
++        return;
++    }
++    match decklink::Output::open() {
++        Ok(out) => {
++            let pic: std::sync::Arc<dyn decklink::RgbaPicture> = std::sync::Arc::new(decklink::OwnedRgba { width: lw, height: lh, pixels: px });
++            let t0 = Instant::now();
++            for i in 0..n {
++                out.send(pic.clone());
++                let due = t0 + Duration::from_millis(40 * (i as u64 + 1));
++                std::thread::sleep(due.saturating_duration_since(Instant::now()));
++            }
++            let st = out.stats();
++            drop(out);
++            outln!(
++                "card ({} sent at 25 fps): shown {} failed {}, convert {:.2} ms, push {:.2} ms per frame",
++                n,
++                st.shown,
++                st.failed,
++                ms(st.convert, st.shown.max(1) as i64),
++                ms(st.display, st.shown.max(1) as i64)
++            );
++        }
++        Err(e) => outln!("card: {e}"),
++    }
++}
++
+ async fn cli_mcp(a: &Args) {
+     if let Some(opt) = a.unknown_opt(&["--bridge", "--project", "--demo", "--data-dir"]) {
+         usage(format!("unknown mcp option `{opt}`"));
+-- 
+2.43.0
+

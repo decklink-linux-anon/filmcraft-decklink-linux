@@ -1,0 +1,206 @@
+From b3813cd8d22ad0092fc0c52ff14480053bf41bff Mon Sep 17 00:00:00 2001
+From: decklink-linux-anon
+ <358323356+decklink-linux-anon@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:42:08 +0200
+Subject: [PATCH 5/7] docs: External Video Output on a DeckLink card
+
+docs/decklink-output.md: what it does, requirements (Linux, a DeckLink
+card, Blackmagic Desktop Video), build, enabling it, decklink-test and
+decklink-bench, measured timings, 25p timeline advice, limitations,
+tested hardware and licences. hardware-parity.md: the external video
+monitoring row.
+---
+ docs/decklink-output.md | 167 ++++++++++++++++++++++++++++++++++++++++
+ docs/hardware-parity.md |   2 +-
+ 2 files changed, 168 insertions(+), 1 deletion(-)
+ create mode 100644 docs/decklink-output.md
+
+diff --git a/docs/decklink-output.md b/docs/decklink-output.md
+new file mode 100644
+index 00000000..51fa42ef
+--- /dev/null
++++ b/docs/decklink-output.md
+@@ -0,0 +1,167 @@
++# External Video Output on a Blackmagic DeckLink card
++
++FilmCraft can show the Program monitor on a client monitor or TV through a Blackmagic DeckLink
++card, so a grade or a cut can be judged on a calibrated display instead of the computer screen.
++This first version is deliberately small: Linux, one card, one video mode, picture only.
++
++> **Experimental, use at your own risk.** This is an unofficial contribution, tested on one machine
++> with one card (see *Tested hardware*). It comes with no warranty and no support, as stated in
++> FilmCraft's licence (MIT OR Apache-2.0, "AS IS"). The author is not liable for any damage to
++> hardware, software or data, or for any other loss, arising from its use.
++
++## What it does
++
++- Sends the **Program monitor's sequence picture** to **DeckLink device 0** as
++  **1920 x 1080, 25p, 8-bit Y'CbCr 4:2:2 (UYVY), BT.709 limited range**, SDR.
++- **Paused or scrubbing:** the frame at the playhead is shown.
++- **Playing:** the frames are prepared ahead and each one goes to the card as soon as it is ready;
++  the card shows it at its next 25p frame boundary. A frame that is not ready in time is skipped
++  and the card holds the previous one.
++- Sequences that are not 1920 x 1080 are scaled to fit, keeping their aspect ratio, with black
++  bars (larger ones are rendered at the fitting size; smaller ones are enlarged by pixel
++  repetition).
++- The picture is the one the Program monitor shows in Composite mode: effects, colour grading,
++  titles and captions included; the monitor's overlays (safe margins, guides, the alpha or
++  channel display modes, the multi-camera grid, comparison view) are not.
++
++### How it works
++
++| Part | Where |
++|---|---|
++| Card access: a small C ABI over the DeckLink API, compiled with `cc`; `libDeckLinkAPI.so` is loaded at run time with `dlopen` | `crates/platform/decklink/shim.cpp`, `crates/platform/build.rs` |
++| Output thread, R'G'B'A to UYVY conversion (integer BT.709 tables), test bars | `crates/platform/src/decklink.rs` (`unsafe` only in `src/decklink/ffi.rs`, per [ADR 0001](adr/0001-platform-ffi.md)) |
++| Following the Program monitor, frame scheduling, the GPU stage, the setting | `crates/ui-egui/src/transmit.rs`, `crates/ui-egui/src/hooks.rs` (`VideoOutput`) |
++| The desktop app's `VideoOutput` (DeckLink) | `apps/filmcraft/src/video_out.rs` |
++| GPU composite and read-back as sRGB RGBA8 | `filmcraft_gpu::ExportRenderer::composite_rgba8` |
++
++Frames are composited on the GPU (an off-screen device, on a thread of its own) and read back,
++about 5–10 ms a 1080p frame; without a usable GPU the CPU compositor's frames are used instead,
++which is too slow for steady playback of 1080p material (about 60 ms a frame) but fine paused.
++
++## Requirements
++
++- **Linux** (x86_64 tested). On macOS and Windows the setting stays greyed out.
++- A **Blackmagic DeckLink** card that can output 1080p25 8-bit YUV (any current DeckLink or
++  UltraStudio does).
++- **Blackmagic Desktop Video** (the driver) installed and the card's firmware up to date:
++  `BlackmagicFirmwareUpdater status` should say `OK`. Desktop Video is a free download from
++  Blackmagic's support site; its Linux package installs `/usr/lib/libDeckLinkAPI.so`.
++  If the same machine dual-boots Windows, use the **same Desktop Video version on both systems**,
++  or the card asks for a firmware change and a restart every time the system changes.
++- A GPU with a Vulkan driver is strongly recommended for smooth playback.
++
++Building needs a C++ compiler (`g++`, e.g. Ubuntu's `build-essential`) in addition to the usual
++FilmCraft build requirements ([contributing.md](contributing.md)). No Blackmagic software or SDK
++is needed to build: the DeckLink SDK include files are in `crates/platform/decklink/sdk/`.
++
++## Build
++
++```sh
++cargo build --release -p filmcraft -p filmcraft-cli
++```
++
++Build the two together: `filmcraft-cli` built alone has no GPU backend (wgpu's backends come from
++the desktop app's features), so its GPU measurements would report "no off-screen device".
++
++## Use it in the desktop app
++
++1. Connect the display to the card's HDMI or SDI output and set the display to 1080p25 / 50 Hz if
++   it does not follow the signal.
++2. Start FilmCraft: `./target/release/filmcraft`.
++3. **Settings ▸ Playback ▸ Enable External Video Output (Blackmagic DeckLink, 1080p25)**.
++   The card opens at once and shows the paused Program frame.
++4. Play as usual. Turning the setting off releases the card.
++
++Only one program can use the card's output at a time: close Media Express, DaVinci Resolve or a
++running `filmcraft-cli decklink-test` first. If the card is missing or busy, FilmCraft logs one
++warning (`External Video Output is on but unavailable: …`) and carries on; turn the setting off
++and on again to retry.
++
++While playing, the log gets a line every 5 seconds, for example:
++
++```text
++External Video Output (GPU): 25.0 frames/s sent, 0 skipped in 5.0 s; GPU composite + read-back 6.1 ms/frame; card: 1250 shown, 0 refused, UYVY 6.3 ms, push 1.2 ms per frame
++```
++
++### Use a 25p timeline
++
++The card runs at exactly 25 frames per second. For smooth motion:
++
++- Set the **sequence to 25 fps** (Sequence Settings) and use **25p (or 50p) material**.
++- Do not mix frame rates on the timeline: 23.976, 29.97 or 59.94 fps clips in a 25 fps
++  sequence, or a 23.976 / 29.97 sequence on the 25p output, are shown with repeated or dropped
++  frames (judder). This is expected with a fixed 25p output, not a fault of the card.
++
++## Check the card without the GUI
++
++```sh
++# 75 % colour bars for 30 s
++./target/release/filmcraft-cli decklink-test --hold 30
++
++# a project frame (at 12 s) for 30 s
++./target/release/filmcraft-cli --project my.fcproj decklink-test --seconds 12 --hold 30
++./target/release/filmcraft-cli --demo decklink-test --hold 30   # the built-in demo project
++```
++
++`decklink-test` exits with an error if the card is missing, busy or refuses the picture.
++
++## Measure where the time goes
++
++```sh
++./target/release/filmcraft-cli --demo decklink-bench --frames 100
++./target/release/filmcraft-cli --project my.fcproj decklink-bench --seconds 30 --frames 100 [--no-card]
++```
++
++It prints the time per frame of the CPU render, the GPU composite + read-back (decoding
++included), the UYVY conversion and, unless `--no-card`, how the card took 25 fps output.
++Measured on the tested machine (demo project, 1080p):
++
++| Stage | Time per frame |
++|---|---|
++| CPU render to RGBA8 (fallback path) | ~58 ms |
++| GPU plan + composite + read-back, decoding included | ~20 ms (composite + read-back alone ~5–10 ms) |
++| RGBA8 to UYVY | ~6 ms |
++
++The UI tests have a throughput benchmark, run on an idle machine:
++
++```sh
++cargo test --release -p filmcraft-ui-egui --test it transmit_ui::bench -- --ignored --nocapture
++```
++
++## Tests
++
++```sh
++cargo test --release -p filmcraft-platform --lib decklink     # conversion, fitting, bars
++cargo test --release -p filmcraft-ui-egui --lib transmit
++cargo test --release -p filmcraft-ui-egui --test it transmit_ui
++```
++
++The UI tests use a stand-in card; on a machine with a card, the `decklink` unit tests also open
++(and close) the real one.
++
++## Limitations
++
++- Linux only; DeckLink device 0 only; 1080p25 only; 8-bit SDR BT.709 only.
++- **No audio** on the card (sound plays on the computer's audio device as usual). Allow for the
++  display's own latency when judging lip sync.
++- Frames go to the card with `DisplayVideoFrameSync`, not DeckLink scheduled playback: pacing
++  follows FilmCraft's playback clock and screen refresh, so an occasional frame can repeat.
++- The output follows the Program monitor while it is drawn; the Source monitor is not sent.
++- No AJA, Mercury Transmit or other devices; no output of the multi-camera grid.
++- On the CPU fallback path, playback of 1080p material skips frames.
++
++## Tested hardware
++
++| | |
++|---|---|
++| Card | Blackmagic DeckLink Mini Monitor HD (PCIe), HDMI to a consumer TV |
++| Driver | Blackmagic Desktop Video 16.5 (DeckLink API 16.5; the vendored headers are API 12.0) |
++| System | Linux (x86_64), NVIDIA GPU (proprietary driver, Vulkan) |
++| Result | steady 1080p25 playback of a 25 fps sequence with 25p material |
++
++## Licences
++
++FilmCraft's own code here is MIT OR Apache-2.0. The DeckLink SDK include files in
++`crates/platform/decklink/sdk/` are Blackmagic Design's, under the Boost Software License
++(BSL-1.0) text reproduced at the top of each file, which permits redistribution with that notice;
++they are listed in `NOTICE` and described in `crates/platform/decklink/sdk/README.md`.
+diff --git a/docs/hardware-parity.md b/docs/hardware-parity.md
+index 9bfbed3e..affb2243 100644
+--- a/docs/hardware-parity.md
++++ b/docs/hardware-parity.md
+@@ -67,7 +67,7 @@ against 793 s with our software encoder (SSIM 0.990). NVENC HEVC round trip 48.9
+ |---|---|---|---|
+ | Audio interfaces | CoreAudio, ASIO, WASAPI; multichannel mapping | cpal (CoreAudio, WASAPI, ALSA); no ASIO; device reports #605, #602 | 60% |
+ | Voice-over microphone | yes | yes (punch-in); macOS privacy declaration missing (#659) | 80% |
+-| External video monitoring (Mercury Transmit, Blackmagic DeckLink, AJA) | yes | no | 0% |
++| External video monitoring (Mercury Transmit, Blackmagic DeckLink, AJA) | yes | Linux: Blackmagic DeckLink device 0, Program monitor at 1080p25 ([decklink-output.md](decklink-output.md)) 8-bit Y'CbCr 4:2:2 BT.709 (Settings ▸ Playback ▸ Enable External Video Output; `filmcraft-cli decklink-test`); no audio, no other modes, no AJA, not macOS / Windows | 15% |
+ | Second computer monitor full-screen playback | yes | full screen inside the app window; no separate-display output or floating windows on other screens (#466) | 40% |
+ | HDR / EDR display | macOS EDR, Windows HDR | no (SDR display of HDR sequences) | 0% |
+ | Control surfaces (EUCON, Mackie HUI / MCU) | yes | no | 0% |
+-- 
+2.43.0
+
